@@ -1,0 +1,680 @@
+---
+title: "Predicting Coupon Redemption"
+author: "Anushree Tomar"
+date: "28 September 2019"
+output:
+  html_document:
+    df_print: paged
+---
+
+XYZ Credit Card company regularly helps it's merchants understand their data better and take key business decisions accurately by providing machine learning and analytics consulting. ABC is an established Brick & Mortar retailer that frequently conducts marketing campaigns for its diverse product range. As a merchant of XYZ, they have sought XYZ to assist them in their discount marketing process using the power of machine learning.
+
+Discount marketing and coupon usage are very widely used promotional techniques to attract new customers and to retain & reinforce loyalty of existing customers. The measurement of a consumer's propensity towards coupon usage and the prediction of the redemption behaviour are crucial parameters in assessing the effectiveness of a marketing campaign.
+ 
+ABC's promotions are shared across various channels including email, notifications, etc. A number of these campaigns include coupon discounts that are offered for a specific product/range of products. The retailer would like the ability to predict whether customers redeem the coupons received across channels, which will enable the retailer's marketing team to accurately design coupon construct, and develop more precise and targeted marketing strategies.
+
+
+
+```{r Import Libraries, message=FALSE, warning=FALSE, paged.print=FALSE,echo=FALSE}
+library(data.table)
+library(caret)
+library(DataExplorer)
+library(lubridate)
+library(xgboost)
+library(dplyr)
+library(pROC)
+library(DMwR)
+library(ggplot2)
+library(gridExtra)
+#library(dataPreparation)
+library(stringr)
+library(Matrix)
+#library(progress)
+```
+
+## Datasets
+
+The data available in this problem contains the following information, including the details of a sample of campaigns and coupons used in previous campaigns -
+
+*	User Demographic Details
+
+*	Campaign and coupon Details
+
+*	Product details
+
+*	Previous transactions
+
+## Problem Statement
+
+Based on previous transaction & performance data from the last 18 campaigns, predict the probability for the next 10 campaigns in the test set for each coupon and customer combination, whether the customer will redeem the coupon or not?
+
+## Data Exploration
+
+ List of all given datasets-
+ 
+```{r,echo=FALSE}
+all_files<-list.files(path = "G:/Arulax Analytics/AmExpert-2019/AmExpert2019", pattern = '.csv', all.files = FALSE,
+           full.names = FALSE, recursive = FALSE,
+           ignore.case = FALSE, include.dirs = FALSE, no.. = FALSE)
+all_files
+```
+Analyse all datasets-
+
+```{r,echo=FALSE}
+alldata<-lapply(all_files, fread)
+sapply(alldata, introduce)
+```
+
+```{r,echo=FALSE}
+### Check Missing and Empty spaces
+# sapply(alldata, function(x)sum(is.na(x)))#check missing values
+# sapply(alldata, function(x)sum(x==""))# check empty spaces
+# print("customer_demographics data have 867 empty spaces")
+```
+
+## Observe all the data
+
+Lets see the observations of the data.
+```{r,echo=FALSE}
+all_files
+lapply(alldata, function(x)head(x,2))
+```
+
+
+```{r,echo=FALSE}
+#all_files
+campaign_data<-as.data.frame(lapply(all_files[1], fread))
+coupon_item_mapping<-as.data.frame(lapply(all_files[2], fread))
+customer_demographics<-as.data.frame(lapply(all_files[3], function(x)fread(x,na.strings = "")))
+customer_transaction_data<-as.data.frame(lapply(all_files[4], fread))
+item_data<-as.data.frame(lapply(all_files[5], fread))
+test_QyjYwdj<-as.data.frame(lapply(all_files[6], fread))
+train<-as.data.frame(lapply(all_files[7], fread))
+```
+
+## Examine the Redemption Status
+```{r,echo=FALSE}
+#prop.table(table(train$redemption_status))
+ggplot(train,aes(x=redemption_status,fill=factor(redemption_status)))+geom_bar()+labs(fill="redemption_status")
+```
+The Proportion of redemption status is unbalnced so we need to balance the status before creating any prediction model. 
+
+
+```{r,echo=FALSE}
+#combined train and test data for data preprocessing
+combined<-rbindlist(list(train, test_QyjYwdj), fill = TRUE)
+```
+
+## Campaign Data
+
+Calculate the duration of campaign 
+```{r,echo=FALSE}
+#convert date column into date format
+campaign_data[,c("start_date","end_date")]<-lapply(campaign_data[,c("start_date","end_date")],dmy)
+#calculate total days of campaign
+campaign_data$campaign_duration<-(campaign_data$end_date)-(campaign_data$start_date)
+campaign_data<-data.table(campaign_data)
+campaign_data[,c("start_date","end_date"):=NULL]
+head(campaign_data)
+
+```
+
+## Analyse campaign type
+```{r, echo=FALSE, warning=FALSE}
+#prop.table(table(train$redemption_status))
+ggplot(campaign_data,aes(x=campaign_duration,fill=factor(campaign_duration)))+geom_bar()+theme(legend.position = "none")+facet_wrap(factor(campaign_data$campaign_type))
+```
+As from the above graph we can see that more duraion spend on the campaign type Y 
+
+## Combine train data and campaign data
+
+```{r include=FALSE, echo=FALSE}
+#count of campaign type by campaign id
+campaign_type<-dcast(campaign_data,campaign_id+campaign_duration~campaign_type,fun.aggregate = length)
+combined<-merge(combined,campaign_type,by="campaign_id")#128595
+head(combined)
+```
+In the train data we merged the campaign data by "campaign_id"
+
+
+## Customer demographics data
+
+```{r,echo=FALSE}
+head(customer_demographics)
+```
+
+```{r,echo=FALSE}
+#factorize data
+customer_demographics<-data.table(customer_demographics)
+customer_demographics[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket")]<-lapply(customer_demographics[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket")], as.factor)
+
+sapply(customer_demographics, function(x)sum(is.na(x)))
+```
+As we can see that some customer demographics data as *marital_status* and *no_of_children* is not available so we need to fill the missing values. 
+
+## Visualise Customer demographics
+
+```{r,echo=FALSE}
+
+g1<-ggplot(subset(customer_demographics,!is.na(marital_status)),aes(x=age_range,fill=marital_status))+geom_bar()
+  
+g2<-ggplot(subset(customer_demographics,!is.na(marital_status)),aes(x=rented,fill=marital_status))+geom_bar()
+
+g3<-ggplot(subset(customer_demographics,!is.na(marital_status)),aes(x=family_size,fill=marital_status))+geom_bar()
+
+g4<-ggplot(subset(customer_demographics,!is.na(marital_status)),aes(x=income_bracket,fill=marital_status))+geom_bar()
+
+grid.arrange(g1,g2,g3,g4)
+```
+From the above graph we can see that most of the customers are married and having age range *46-55*,*36-45*, family size of *2* with income bracket of *4*,*5* and not rented.
+
+
+* Impute *no_of_children*
+
+```{r,echo=FALSE}
+table(customer_demographics$no_of_children)
+customer_demographics[which(is.na(customer_demographics$no_of_children)),"no_of_children"] <- "0"
+```
+There are 3 levels in the *no_of_children* 1,2, and 3+ so we will fill the missing value with "0"
+
+```{r,echo=FALSE}
+table(customer_demographics$no_of_children)
+```
+
+```{r,echo=FALSE}
+ggplot(subset(customer_demographics,!is.na(marital_status)),aes(x=no_of_children,fill=marital_status))+geom_bar()
+```
+From the above graph we can see that most of the married customer have children but most of single customer not having children.
+
+* Impute *marital_status* 
+
+To impute *marital_status* we need to focus on family_size and no_of_children.
+most of the single customers have *family size*- 1  and 0 -*no_of_children*
+```{r,echo=FALSE}
+customer_demographics[which(is.na(customer_demographics$marital_status) & customer_demographics$family_size==1&customer_demographics$no_of_children==0),"marital_status"] <-"Single"
+
+customer_demographics[which(is.na(customer_demographics$marital_status) & customer_demographics$family_size!=1),"marital_status"] <-"Married"
+
+sapply(customer_demographics,head)
+```
+
+```{r,echo=FALSE}
+combined<-merge(combined,customer_demographics,by="customer_id",all.x = TRUE)
+```
+
+
+
+## Item data
+```{r,echo=FALSE}
+head(item_data)
+```
+
+## Coupon Item mapping data
+```{r,echo=FALSE}
+head(coupon_item_mapping)
+```
+
+```{r,echo=FALSE}
+coup_iteminfo<-merge(coupon_item_mapping,item_data)
+head(coup_iteminfo)
+```
+In the coupon_item_mapping  data we added the information of items by item_id 
+
+
+## brand type 
+```{r,echo=FALSE}
+coup_iteminfo[,c("brand","brand_type","category")]<-lapply(coup_iteminfo[,c("brand","brand_type","category")], as.factor)
+table(coup_iteminfo$brand_type)
+
+```
+## Count of brand type by coupon id
+```{r,echo=FALSE,message=FALSE, warning=FALSE, paged.print=FALSE}
+brandtype <- dcast(coup_iteminfo,coupon_id~brand_type,length)
+head(brandtype)
+```
+
+```{r,echo=FALSE}
+colSums(brandtype)
+```
+## Count of Category by coupon id
+```{r message=FALSE, warning=FALSE, paged.print=FALSE,echo=FALSE}
+category<-dcast(coup_iteminfo,coupon_id~category,length)
+#brand<-dcast(cop_iteminfo,coupon_id~brand,length)#will create much col.
+head(category)
+```
+
+```{r,echo=FALSE}
+colSums(category)
+combined<-merge(combined,brandtype,by="coupon_id")
+combined<-merge(combined,category,by="coupon_id")
+```
+
+## Customer Transaction data
+```{r,echo=FALSE}
+head(customer_transaction_data)
+```
+From the above data we will analyse customers purchasing pattern by RFM analysis then will calculate Final price after discount.
+
+```{r,echo=FALSE}
+#convert date format
+customer_transaction_data$date<-ymd(customer_transaction_data$date)
+# replace regular exp to cal total discount
+customer_transaction_data$other_discount<-gsub("-"," ",customer_transaction_data$other_discount)
+customer_transaction_data$coupon_discount<-gsub("-"," ",customer_transaction_data$coupon_discount)
+customer_transaction_data<-data.table(customer_transaction_data)
+
+#calculate final price
+customer_transaction_data$Finalprice<-(customer_transaction_data$selling_price)-(as.numeric(customer_transaction_data$coupon_discount)+as.numeric(customer_transaction_data$other_discount))
+
+#cal quantity of products
+quantity<-customer_transaction_data[,list("totquant"=sum(quantity)),by=list(customer_id)]
+quantity$customer_id<-as.integer(quantity$customer_id)
+combined<-merge(combined,quantity,by="customer_id")
+
+# RFM analysis
+monetory<-customer_transaction_data[,list("totmonetory"=sum(Finalprice)),by=list(customer_id)]
+monetory$customer_id<-as.integer(monetory$customer_id)
+combined<-merge(combined,monetory,by="customer_id")
+
+Freqcust<-customer_transaction_data[,list(unique(date)),by=list(customer_id)]
+Freqcust<-as.data.frame(table(Freqcust$customer_id))
+names(Freqcust)<-c("customer_id","Freqcust")
+Freqcust$customer_id<-as.integer(Freqcust$customer_id)
+combined<-merge(combined,Freqcust,by="customer_id")
+
+lastdate<-max(customer_transaction_data$date)
+recency<-customer_transaction_data[,list("maxdate"=max(date)),by=list(customer_id)]
+recency$recency<-lastdate-recency$maxdate
+recency<-recency[,c(1,3)]
+recency$customer_id<-as.integer(recency$customer_id)
+combined<-merge(combined,recency,by="customer_id")
+combined<-combined[,-c("coupon_id","campaign_id","customer_id")]
+combined$recency<-as.numeric(combined$recency)
+
+```
+
+
+```{r,echo=FALSE}
+#isolate train & test data
+
+newtest<-semi_join(combined,test_QyjYwdj,by="id")
+newtest<-data.table(newtest)
+newtest[,"redemption_status":=NULL]
+newtrain<-semi_join(combined,train,by="id")
+newtrain<-data.table(newtrain)
+
+```
+
+
+
+```{r,echo=FALSE}
+newtrain[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket","redemption_status")]<-lapply(newtrain[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket","redemption_status")], as.factor)
+
+newtrain[which(is.na(newtrain$age_range)),"age_range"] <- "46-55"
+newtrain[which(is.na(newtrain$marital_status)),"marital_status"] <- "Married"
+newtrain[which(is.na(newtrain$rented)),"rented"] <- "0"
+newtrain[which(is.na(newtrain$family_size)),"family_size"] <- "2"
+newtrain[which(is.na(newtrain$no_of_children)),"no_of_children"] <- "0"
+newtrain[which(is.na(newtrain$income_bracket)),"income_bracket"] <- "5"
+
+```
+
+
+```{r,echo=FALSE}
+#Imputation in newtest
+newtest[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket")]<-lapply(newtest[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket")], as.factor)
+
+#imput in newtest
+
+newtest[which(is.na(newtest$age_range)),"age_range"] <- "46-55"
+newtest[which(is.na(newtest$marital_status)),"marital_status"] <- "Married"
+newtest[which(is.na(newtest$rented)),"rented"] <- "0"
+newtest[which(is.na(newtest$family_size)),"family_size"] <- "2"
+newtest[which(is.na(newtest$no_of_children)),"no_of_children"] <- "0"
+newtest[which(is.na(newtest$income_bracket)),"income_bracket"] <- "5"
+
+```
+
+
+```{r,echo=FALSE}
+newtrain<-newtrain[,-c("id")]
+newtrain$campaign_duration<-as.numeric(newtrain$campaign_duration)
+
+newtest<-newtest[,-c("id")]
+ newtest$campaign_duration<-as.numeric(newtest$campaign_duration)
+```
+
+## Summarize Final traindata
+```{r,echo=FALSE}
+#remove constant value
+newtest<-newtest[,-"Restauarant"]
+newtrain<-newtrain[,-"Restauarant"]
+summary(newtrain)
+```
+
+
+```{r,echo=FALSE}
+#data partition
+trainindex<-createDataPartition(newtrain$redemption_status,1,p=0.8,list=F)
+traindata<-newtrain[trainindex,]
+testdata<-newtrain[-trainindex,]
+
+```
+
+## Balance the redemption status
+```{r,echo=FALSE}
+smotedata<-SMOTE(redemption_status~., traindata, perc.over = 600, k = 5, perc.under = 600,
+      learner = NULL)
+
+ggplot(smotedata,aes(x=redemption_status,fill=redemption_status))+geom_bar()
+```
+
+## Encode the categorical features of the data
+```{r,echo=FALSE}
+# one hot encode the data
+smotedata[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket","redemption_status")]<-lapply(smotedata[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket","redemption_status")], function(x)as.numeric(x)-1)
+
+testdata[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket","redemption_status")]<-lapply(testdata[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket","redemption_status")],function(x) as.numeric(x)-1)
+
+newtest[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket")]<-lapply(newtest[,c("marital_status","family_size","no_of_children","age_range","rented","income_bracket")], function(x)as.numeric(x)-1)
+
+head(smotedata)
+```
+
+## Normalize the data
+```{r,echo=FALSE}
+#normalize the data
+normalze<-function(x){
+  ((x)-min(x))/(max(x)-min(x))
+}
+smotedataN<-as.data.frame(lapply(smotedata, normalze))
+testdataN<-as.data.frame(lapply(testdata, normalze))
+newtestN<-as.data.frame(lapply(newtest,normalze))
+summary(testdataN)
+```
+
+## Predictive Model and Evaluation
+
+## XGBoost Model
+
+```{r eval=FALSE, include=FALSE}
+xgbGrid <-  expand.grid(eta = c(0.1,0.3,1), 
+                            colsample_bytree=c(0.5,0.7,1),
+                            max_depth=c(3,5,6),
+                            nrounds=100,
+                            gamma=c(1,5,7),
+                            min_child_weight=c(0.5,1,2)
+                            )
+set.seed(123)
+#10 fold cv
+ctrl<-trainControl("cv",number = 10,savePredictions = TRUE,classProbs = T,summaryFunction = twoClassSummary)
+smotedataN$redemption_status<-as.factor(smotedataN$redemption_status)
+levels(smotedataN$redemption_status) <- make.names(levels(factor(smotedataN$redemption_status)))
+
+xgb <- train(factor(redemption_status) ~ ., data = smotedataN, 
+                      method = "xgbTree",
+                      tunegrid= xgbGrid,
+                      #preProcess=c("scale","center"),
+                      trControl= ctrl,
+                      metric="ROC",
+                      na.action = na.omit
+)
+
+
+xgb#summary
+#saveRDS(xgb, "xgbmodel7cor.rds")
+
+```
+
+
+```{r,echo=FALSE}
+#Predictions
+xgb<-readRDS("xgbmodel7cor.rds")
+xgbpred <-predict(xgb, testdataN)
+xgbpred<-data.frame(xgbpred)
+xgbpred$xgbpred<-gsub("X","",xgbpred$xgbpred)
+
+# submission <-predict(xgb, newtestN,na.action = na.pass)
+# submission<-data.frame(submission)
+# submission$submission<-gsub("X","",submission$submission)
+# finaldata<-cbind(test_QyjYwdj$id,submission)
+# colnames(finaldata)<-c("id","redemption_status")
+# finaldata<-data.frame(finaldata)
+
+#write.csv(finaldata,"model7cor.csv",row.names = F)#Area under the curve:  0.6048   
+#xgb$bestTune
+
+```
+
+
+
+## Confusion Matrix
+```{r,echo=FALSE}
+confusionMatrix(factor(testdata$redemption_status),factor(xgbpred$xgbpred),mode="everything",positive = "1")
+```
+
+## AUC 
+```{r include=FALSE}
+roc_obj <- roc(as.numeric(testdataN$redemption_status),as.numeric(xgbpred$xgbpred))
+```
+
+```{r,echo=FALSE}
+
+auc(roc_obj)
+```
+
+## Plot ROC curve
+```{r,echo=FALSE}
+#library(pROC)
+plot(roc_obj)
+
+```
+
+
+## Neural Network model
+```{r eval=FALSE, include=FALSE}
+nnetGrid <-  expand.grid(size = seq(from = 1, to = 10, by = 1),
+                        decay = seq(from = 0.1, to = 0.5, by = 0.1))
+
+ctrl<-trainControl("cv",number = 10,savePredictions = TRUE,classProbs = T,summaryFunction = twoClassSummary)
+
+levels(smotedata$redemption_status) <- make.names(levels(factor(smotedata$redemption_status)))
+
+nnetModel <- train(smotedataN[,-"redemption_status"], smotedataN$redemption_status, 
+                    method = "nnet",
+                    tunefgrid=nnetGrid,
+                    preProcess=c("scale","center"),
+                    trControl= ctrl,
+                    metric="ROC"
+                    )
+
+#saveRDS(nnetModel, "nnetModel8.rds")
+
+```
+
+
+```{r,echo=FALSE}
+
+#Predictions
+nnetModel<-readRDS("nnetModel8.rds")
+pred <-predict(nnetModel,testdataN)
+pred<-data.frame(pred)
+pred$pred<-gsub("X","",pred$pred)
+
+# submission <-predict(nnetModel,newtestN,na.action = na.pass)
+# submission<-data.frame(submission)
+# submission$submission<-gsub("X","",submission$submission)
+# 
+# finaldata<-cbind(test_QyjYwdj$id,submission)
+# colnames(finaldata)<-c("id","redemption_status")
+# finaldata<-data.frame(finaldata)
+
+#write.csv(finaldata,"model8.csv",row.names = F)# Area under the curve: 0.5742  
+
+```
+
+```{r include=FALSE}
+rocCurve   <- roc(response = as.numeric(testdataN$redemption_status),
+                      predictor = as.numeric(pred$pred)
+                      #levels = rev(levels(testdata$redemption_status))
+                  )
+```
+
+## AUC
+```{r,echo=FALSE}
+auc(rocCurve)
+```
+
+## Confusion Matrix
+```{r,echo=FALSE}
+confusionMatrix(factor(testdata$redemption_status),factor(pred$pred),mode="everything",positive = "1")
+```
+
+## ROC curve
+```{r,echo=FALSE}
+plot(rocCurve, print.thres = "best")
+```
+
+
+
+## Random Forest Model
+```{r eval=FALSE, include=FALSE}
+set.seed(123)
+RF <- train(factor(redemption_status) ~ ., data = smotedataN,
+              method = "rf",
+               metric = "ROC",
+               trControl = trainControl(method = "cv",
+                                        classProbs = TRUE,
+                                        summaryFunction = twoClassSummary))
+#saveRDS(RF,"RFmodel9.rds")
+getTrainPerf(RF)
+```
+
+
+```{r,echo=FALSE}
+#Predictions
+RF<-readRDS("RFmodel9.rds")
+pred <-predict(RF,testdataN)
+pred<-data.frame(pred)
+pred$pred<-gsub("X","",pred$pred)
+pred<-data.frame(pred)
+#newtestN<-na.omit(newtestN)
+# submission <-predict(RF,newtestN)
+# submission<-data.frame(submission)
+# submission$submission<-gsub("X","",submission$submission)
+# 
+# finaldata<-cbind(test_QyjYwdj$id,submission)
+# colnames(finaldata)<-c("id","redemption_status")
+# finaldata<-data.frame(finaldata)
+
+#write.csv(finaldata,"model9.csv",row.names = F)# Area under the curve:0.6319
+
+```
+ 
+```{r include=FALSE}
+rocCurve   <- roc(response = as.numeric(testdata$redemption_status),
+                      predictor = as.numeric(pred$pred)
+                      #levels = rev(levels(testdata$redemption_status))
+                  )
+```
+ 
+## AUC 
+```{r,echo=FALSE}
+auc(rocCurve)
+```
+
+
+## Confusion Matrix
+```{r,echo=FALSE}
+confusionMatrix(factor(testdata$redemption_status),factor(pred$pred),mode="everything",positive = "1")
+```
+
+## ROC curve
+```{r,echo=FALSE}
+plot(rocCurve, print.thres = "best")
+
+```
+
+## XGBoost Model
+
+Train the Model without normalization  
+```{r eval=FALSE, include=FALSE}
+xgbGrid <-  expand.grid(eta = c(0.1,0.3,1), 
+                            colsample_bytree=c(0.5,0.7,1),
+                            max_depth=c(3,5,6),
+                            nrounds=100,
+                            gamma=c(1,5,7),
+                            min_child_weight=c(0.5,1,2)
+                            )
+
+#10 fold cv
+ctrl<-trainControl("cv",number = 10,savePredictions = TRUE,classProbs = T,summaryFunction = twoClassSummary)
+smotedata$redemption_status<-as.factor(smotedata$redemption_status)
+levels(smotedata$redemption_status) <- make.names(levels(factor(smotedata$redemption_status)))
+
+set.seed(123)
+xgb <- train(factor(redemption_status) ~ ., data = smotedata, 
+                      method = "xgbTree",
+                      tunegrid= xgbGrid,
+                      trControl= ctrl,
+                      metric="ROC",
+                      na.action = na.omit)
+xgb#summary
+#saveRDS(xgb, "xgbmodel10.rds")
+
+```
+
+```{r,echo=FALSE}
+
+xgb1<-readRDS("xgbmodel10.rds")
+#Predictions
+xgbpred <-predict(xgb1, testdata)
+xgbpred<-data.frame(xgbpred)
+xgbpred$xgbpred<-gsub("X","",xgbpred$xgbpred)
+
+# submission <-predict(xgb, newtest,na.action = na.pass)
+# submission<-data.frame(submission)
+# submission$submission<-gsub("X","",submission$submission)
+# finaldata<-cbind(test_QyjYwdj$id,submission)
+# colnames(finaldata)<-c("id","redemption_status")
+# finaldata<-data.frame(finaldata)
+
+#write.csv(finaldata,"model10.csv",row.names = F)#Area under the curve:   
+#xgb$bestTune
+
+
+```
+
+## Confusion Matrix
+```{r,echo=FALSE}
+confusionMatrix(factor(testdata$redemption_status),factor(xgbpred$xgbpred),mode="everything",positive = "1")
+```
+
+```{r include=FALSE}
+rocCurve   <- roc(response = as.numeric(testdata$redemption_status),
+                      predictor = as.numeric(pred$pred)
+                      #levels = rev(levels(testdata$redemption_status))
+                  )
+```
+
+## AUC
+```{r,echo=FALSE}
+auc(rocCurve)
+```
+
+## ROC curve
+```{r,echo=FALSE}
+plot(rocCurve)
+```
+
+
+
+
+
+
+
+
+
+
+
+
